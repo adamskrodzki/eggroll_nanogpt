@@ -18,6 +18,40 @@ Because the code is so simple, it is very easy to hack to your needs, train new 
 
 ## install
 
+### AMD ROCm Support (Ryzen AI / Radeon)
+
+**Note:** For many setups (like Fedora with modern kernels), you just need the ROCm wheels. The following command installs PyTorch with ROCm 6.2 support (check [pytorch.org](https://pytorch.org/get-started/locally/) for the exact version matching your system):
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/rocm6.3
+```
+
+Then install the rest of the dependencies:
+
+```bash
+pip install numpy transformers datasets tiktoken wandb tqdm
+```
+
+Verify it works by running `python -c "import torch; print(torch.cuda.is_available())"`. It should print `True`.
+
+### Running on AMD
+To train on your GPU, simply run the script as normal. PyTorch ROCm maps `cuda` commands to your AMD GPU automatically:
+
+```bash
+python TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 HSA_OVERRIDE_GFX_VERSION=11.0.0 train.py config/train_shakespeare_char.py --compile=False
+```
+
+(No need to change `--device=cuda`, it acts as the default).
+
+If that fails with "HIP error: ROCm platform not found", try:
+
+HSA_OVERRIDE_GFX_VERSION=11.0.0 python train.py config/train_shakespeare_char.py --compile=False
+
+this command will override the GPU version to 11.0.0, which is the latest version supported by ROCm 6.3.
+
+### Standard Install (NVIDIA / CPU)
+
+
 ```
 pip install torch numpy transformers datasets tiktoken wandb tqdm
 ```
