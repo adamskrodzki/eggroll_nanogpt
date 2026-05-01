@@ -1,3 +1,8 @@
+# EGGROLL hyperparameters
+pop_size = 1024          # number of population members per iteration (N)
+rank = 1                 # rank of perturbations (r)
+sigma = 0.01             # ES noise standard deviation
+alpha = 0.1              # learning rate (step size)
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
