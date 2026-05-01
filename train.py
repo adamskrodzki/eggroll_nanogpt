@@ -46,7 +46,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 accumulation_steps = 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 12 # if accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -288,7 +288,7 @@ while True:
         if iter_num >= 5:  # let the training loop settle a bit
             steps_log = 1 if iter_num == 0 else log_interval
             dt_avg = dt / steps_log
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt_avg)
+            mfu = raw_model.estimate_mfu(batch_size * accumulation_steps, dt_avg)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt_avg*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         else:

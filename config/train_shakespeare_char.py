@@ -1,5 +1,5 @@
 # EGGROLL hyperparameters
-pop_size = 1024          # number of population members per iteration (N)
+pop_size = 16          # number of population members per iteration (N)
 rank = 1                 # rank of perturbations (r)
 sigma = 0.01             # ES noise standard deviation
 alpha = 0.1              # learning rate (step size)
@@ -20,7 +20,7 @@ wandb_project = 'shakespeare-char'
 wandb_run_name = 'mini-gpt'
 
 dataset = 'shakespeare_char'
-accumulation_steps = 8
+accumulation_steps = 16
 batch_size = 1
 block_size = 256 # context of up to 256 previous characters
 
