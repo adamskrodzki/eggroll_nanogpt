@@ -226,12 +226,41 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            with ctx:
+            with torch.no_grad(), ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
+
+
+def aggregate_linear_layer_updates(linear_layers, fitness, alpha, N, rank):
+    for layer in linear_layers:
+        A = layer.A.squeeze(-1) if rank == 1 else layer.A.view(N, -1, rank)
+        B = layer.B.squeeze(-1) if rank == 1 else layer.B.view(N, -1, rank)
+        if rank == 1:
+            delta = (alpha / N) * (A.T @ (fitness.unsqueeze(1) * B))
+        else:
+            # general rank: sum over rank dimension
+            delta = (alpha / N) * torch.einsum('nr,ni,no->oi', fitness, B, A)
+        layer.M.data += delta
+        layer.set_population(None, None)
+
+
+def aggregate_linear_layer_updates_best_fitness(linear_layers, fitness, alpha, N, rank):
+    best_idx = torch.argmax(fitness).item()
+    best_fit = fitness[best_idx]
+    for layer in linear_layers:
+        if rank == 1:
+            A_best = layer.A[best_idx].squeeze(-1)   # (out)
+            B_best = layer.B[best_idx].squeeze(-1)   # (in)
+            delta = best_fit * alpha * torch.outer(A_best, B_best)   # (out, in)
+        else:
+            A_best = layer.A[best_idx]               # (out, r)
+            B_best = layer.B[best_idx]               # (in, r)
+            delta = best_fit * alpha * (A_best @ B_best.T)      # (out, in)
+        layer.M.data += delta
+        layer.set_population(None, None)
 
 # -----------------------------------------------------------------------------
 # EGGROLL training loop (replaces backprop)
@@ -255,7 +284,7 @@ while True:
         # expand batch to population dimension
         X_pop = X.unsqueeze(0).expand(pop_size, -1, -1)
         Y_pop = Y.unsqueeze(0).expand(pop_size, -1, -1)
-        with ctx:
+        with torch.no_grad(), ctx:
             _, loss_per_member = model(X_pop, Y_pop)
         acc_loss += loss_per_member
 
@@ -263,18 +292,7 @@ while True:
     fitness = -avg_loss.detach()
     fitness = fitness - fitness.mean()       # centre
 
-    # aggregate updates
-    for layer in linear_layers:
-        A = layer.A.squeeze(-1) if rank == 1 else layer.A.view(N, -1, rank)  # keep rank >1 general
-        B = layer.B.squeeze(-1) if rank == 1 else layer.B.view(N, -1, rank)
-        if rank == 1:
-            delta = (alpha / N) * (A.T @ (fitness.unsqueeze(1) * B))
-        else:
-            # general rank: sum over rank dimension
-            delta = (alpha / N) * torch.einsum('nr,ni,no->oi', fitness, B, A)
-        layer.M.data += delta
-        # clear population factors to free memory
-        layer.set_population(None, None)
+    aggregate_linear_layer_updates_best_fitness(linear_layers, fitness, alpha, N, rank)
 
     # logging and evaluation (same as original)
     if iter_num % log_interval == 0 and master_process:
@@ -285,12 +303,13 @@ while True:
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
+        best_idx = torch.argmax(acc_loss).item();
         if iter_num >= 5:  # let the training loop settle a bit
             steps_log = 1 if iter_num == 0 else log_interval
             dt_avg = dt / steps_log
-            mfu = raw_model.estimate_mfu(batch_size * accumulation_steps, dt_avg)
+            mfu = raw_model.estimate_mfu(batch_size * accumulation_steps, dt_avg, pop_size)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt_avg*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt_avg*1000:.2f}ms, mfu {running_mfu*100:.2f}%, min loss {acc_loss[best_idx].item():.4f}")
         else:
             print(f"iter {iter_num}: loss {lossf:.4f}")
 
