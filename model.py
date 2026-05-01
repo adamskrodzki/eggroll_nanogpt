@@ -364,21 +364,24 @@ class GPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt, pop_size):
-        """Estimate MFU for EGGROLL.
+        """Estimate MFU for EGGROLL (forward-only + LoRA corrections).
         fwdbwd_per_iter = batch_size * accumulation_steps (micro steps per iteration).
         dt = time per iteration (s).
         """
         N = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
-        # FLOPs per token for a full forward+backward pass (reference)
-        flops_per_token = 6 * N + 12 * L * H * Q * T
-        # Total tokens processed per iteration:
-        #   fwdbwd_per_iter = number of sequences (batch_size * accum_steps)
-        #   each sequence: T tokens
-        #   multiplied by population size (all members)
-        total_tokens = fwdbwd_per_iter * T * pop_size   # pop_size is defined in outer scope
-        flops_per_iter = total_tokens * flops_per_token
+        C, L, T, V = cfg.n_embd, cfg.n_layer, cfg.block_size, cfg.vocab_size
+        r = cfg.rank
+        # sum of (in + out) across all EGGROLLinear layers
+        sum_f = 16 * C * L + C + V
+        # FLOPs per token for one population member:
+        #   dense forward: 2 * N (matmuls only, no backward)
+        #   LoRA correction (per member): 2 * r * sum_f (B proj + A proj)
+        #   attention forward: 4 * L * C * T (QK^T + PV, no backward)
+        flops_per_member = 2 * N + 2 * r * sum_f + 4 * L * C * T
+        # each generation evaluates all pop_size members
+        total_tokens = fwdbwd_per_iter * T * pop_size
+        flops_per_iter = total_tokens * flops_per_member
         flops_achieved = flops_per_iter / dt
         flops_promised = 30e12   # adjust to your GPU (312e12 for A100)
         return flops_achieved / flops_promised

@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, EGGROLLinear
+from strategies import EGGROLLStrategy, STRATEGY_REGISTRY
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -60,6 +61,7 @@ rank = 1
 sigma = 0.01
 alpha = 0.1
 max_iters = 100000
+strategy = 'standard' # 'standard' or 'greedy'; selects EGGROLL update strategy
 # adamw optimizer (not used, but keep for compatibility)
 learning_rate = 6e-4 # max learning rate
 weight_decay = 1e-1
@@ -201,6 +203,9 @@ model.to(device)
 # EGGROLL: collect all linear layers
 linear_layers = [module for module in model.modules() if isinstance(module, EGGROLLinear)]
 
+# EGGROLL: instantiate update strategy
+egroll_strategy = STRATEGY_REGISTRY[strategy](alpha=alpha, sigma=sigma, rank=rank, pop_size=pop_size)
+
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -234,34 +239,6 @@ def estimate_loss():
     return out
 
 
-def aggregate_linear_layer_updates(linear_layers, fitness, alpha, N, rank):
-    for layer in linear_layers:
-        A = layer.A.squeeze(-1) if rank == 1 else layer.A.view(N, -1, rank)
-        B = layer.B.squeeze(-1) if rank == 1 else layer.B.view(N, -1, rank)
-        if rank == 1:
-            delta = (alpha / N) * (A.T @ (fitness.unsqueeze(1) * B))
-        else:
-            # general rank: sum over rank dimension
-            delta = (alpha / N) * torch.einsum('nr,ni,no->oi', fitness, B, A)
-        layer.M.data += delta
-        layer.set_population(None, None)
-
-
-def aggregate_linear_layer_updates_best_fitness(linear_layers, fitness, alpha, N, rank):
-    best_idx = torch.argmax(fitness).item()
-    best_fit = fitness[best_idx]
-    for layer in linear_layers:
-        if rank == 1:
-            A_best = layer.A[best_idx].squeeze(-1)   # (out)
-            B_best = layer.B[best_idx].squeeze(-1)   # (in)
-            delta = best_fit * alpha * torch.outer(A_best, B_best)   # (out, in)
-        else:
-            A_best = layer.A[best_idx]               # (out, r)
-            B_best = layer.B[best_idx]               # (in, r)
-            delta = best_fit * alpha * (A_best @ B_best.T)      # (out, in)
-        layer.M.data += delta
-        layer.set_population(None, None)
-
 # -----------------------------------------------------------------------------
 # EGGROLL training loop (replaces backprop)
 # -----------------------------------------------------------------------------
@@ -270,18 +247,12 @@ local_iter_num = 0
 running_mfu = -1.0
 
 while True:
-    # sample population factors for all linear layers
-    N = pop_size
-    for layer in linear_layers:
-        A = torch.randn(N, layer.out_features, rank, device=device, dtype=torch.float32)
-        B = torch.randn(N, layer.in_features, rank, device=device, dtype=torch.float32)
-        layer.set_population(A, B)
+    egroll_strategy.sample_population(linear_layers, device)
 
     acc_loss = torch.zeros(pop_size, device=device)
 
     for step in range(accumulation_steps):
         X, Y = get_batch('train')
-        # expand batch to population dimension
         X_pop = X.unsqueeze(0).expand(pop_size, -1, -1)
         Y_pop = Y.unsqueeze(0).expand(pop_size, -1, -1)
         with torch.no_grad(), ctx:
@@ -290,9 +261,10 @@ while True:
 
     avg_loss = acc_loss / accumulation_steps
     fitness = -avg_loss.detach()
-    fitness = fitness - fitness.mean()       # centre
+    fitness = fitness - fitness.mean()
 
-    aggregate_linear_layer_updates_best_fitness(linear_layers, fitness, alpha, N, rank)
+    egroll_strategy.compute_update(linear_layers, fitness, avg_loss)
+    egroll_strategy.on_generation_end(avg_loss)
 
     # logging and evaluation (same as original)
     if iter_num % log_interval == 0 and master_process:
