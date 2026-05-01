@@ -97,18 +97,23 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        # handle population dimension
+        # x can be (B, T, C) or (N, B, T, C)
         if x.dim() == 4:
             N, B, T, C = x.shape
-            x = x.view(N*B, T, C)
+            total_batch = N * B
+            x = x.view(total_batch, T, C)
             merge_nb = True
         else:
             B, T, C = x.shape
+            total_batch = B
+            N = 1
             merge_nb = False
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(total_batch, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(total_batch, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(total_batch, T, self.n_head, C // self.n_head).transpose(1, 2)
+
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
@@ -117,8 +122,9 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = y.transpose(1, 2).contiguous().view(total_batch, T, C)
         y = self.resid_dropout(self.c_proj(y))
+
         if merge_nb:
             y = y.view(N, B, T, C)
         return y

@@ -45,7 +45,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+accumulation_steps = 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -96,14 +96,14 @@ if ddp:
     seed_offset = ddp_rank # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
+    assert accumulation_steps % ddp_world_size == 0
+    accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+tokens_per_iter = accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
@@ -236,7 +236,6 @@ def estimate_loss():
 # -----------------------------------------------------------------------------
 # EGGROLL training loop (replaces backprop)
 # -----------------------------------------------------------------------------
-X, Y = get_batch('train')  # fetch the very first batch (single batch, no population)
 t0 = time.time()
 local_iter_num = 0
 running_mfu = -1.0
@@ -249,14 +248,19 @@ while True:
         B = torch.randn(N, layer.in_features, rank, device=device, dtype=torch.float32)
         layer.set_population(A, B)
 
-    # expand batch to population dimension
-    X_pop = X.unsqueeze(0).expand(N, -1, -1)  # (N, B, T)
-    Y_pop = Y.unsqueeze(0).expand(N, -1, -1)  # (N, B, T)
+    acc_loss = torch.zeros(pop_size, device=device)
 
-    # forward pass for whole population
-    with ctx:
-        logits, loss_per_member = model(X_pop, Y_pop)  # loss_per_member shape (N,)
-    fitness = -loss_per_member.detach()
+    for step in range(accumulation_steps):
+        X, Y = get_batch('train')
+        # expand batch to population dimension
+        X_pop = X.unsqueeze(0).expand(pop_size, -1, -1)
+        Y_pop = Y.unsqueeze(0).expand(pop_size, -1, -1)
+        with ctx:
+            _, loss_per_member = model(X_pop, Y_pop)
+        acc_loss += loss_per_member
+
+    avg_loss = acc_loss / accumulation_steps
+    fitness = -avg_loss.detach()
     fitness = fitness - fitness.mean()       # centre
 
     # aggregate updates
