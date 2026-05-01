@@ -15,6 +15,70 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# -----------------------------------------------------------------------------
+# Custom layer for EGGROLL
+
+class EGGROLLinear(nn.Module):
+    """Linear layer with low‑rank ES perturbations (r=1 by default)."""
+    def __init__(self, in_features, out_features, bias=True, r=1, sigma=0.01):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.r = r
+        self.sigma = sigma
+        self.M = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+        # Population factors – set before forward
+        self.A = None   # (N, out_features, r)
+        self.B = None   # (N, in_features, r)
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.M, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.M)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def set_population(self, A, B):
+        """Store population factors (N, out, r) and (N, in, r)."""
+        self.A = A
+        self.B = B
+
+    def forward(self, x):
+        # x shape:
+        #   - (B, T, in_features) : standard forward (no perturbation)
+        #   - (N, B, T, in_features) : population forward with perturbation
+        if self.A is None or x.dim() == 3:
+            # No perturbation or no population dimension: just base computation
+            out = x @ self.M.T
+            if self.bias is not None:
+                out += self.bias
+            return out
+
+        # x: (N, B, T, in_features)
+        N, B, T, in_f = x.shape
+        # Base output: compute once using the first member (all are identical)
+        base = x[0] @ self.M.T                    # (B, T, out_features)
+        if self.bias is not None:
+            base += self.bias
+        base = base.unsqueeze(0).expand(N, -1, -1, -1)   # (N, B, T, out)
+
+        # Low‑rank correction
+        x_flat = x.view(N, B*T, in_f)            # (N, B*T, in_f)
+        # A: (N, out, r), B: (N, in, r)
+        tmp = torch.einsum('nbd, nir -> nbr', x_flat, self.B)   # (N, B*T, r)
+        correction = (self.sigma / math.sqrt(self.r)) * torch.einsum('nbr, nor -> nbo', tmp, self.A)   # (N, B*T, out)
+        correction = correction.view(N, B, T, -1)
+        return base + correction
+
+# -----------------------------------------------------------------------------
+# Original LayerNorm (unchanged)
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -32,9 +96,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = EGGROLLinear(config.n_embd, 3 * config.n_embd, bias=config.bias, sigma=config.sigma, r=config.rank)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = EGGROLLinear(config.n_embd, config.n_embd, bias=config.bias, sigma=config.sigma, r=config.rank)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -50,9 +114,17 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # x can be (B, T, C) or (N, B, T, C)
+        # Merge N and B for attention (treat population as extra batch)
+        if x.dim() == 4:
+            N, B, T, C = x.shape
+            x = x.view(N*B, T, C)
+            merge_nb = True
+        else:
+            B, T, C = x.shape
+            N = 1
+            merge_nb = False
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -61,7 +133,7 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -70,18 +142,19 @@ class CausalSelfAttention(nn.Module):
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        if merge_nb:
+            y = y.view(N, B, T, C)
         return y
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = EGGROLLinear(config.n_embd, 4 * config.n_embd, bias=config.bias, sigma=config.sigma, r=config.rank)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = EGGROLLinear(4 * config.n_embd, config.n_embd, bias=config.bias, sigma=config.sigma, r=config.rank)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -114,6 +187,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    sigma: float = 0.01      # ES noise standard deviation
+    rank: int = 1            # rank of low‑rank perturbations
 
 class GPT(nn.Module):
 
@@ -130,12 +205,12 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = EGGROLLinear(config.n_embd, config.vocab_size, bias=False, sigma=config.sigma, r=config.rank)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.M
 
         # init all weights
         self.apply(self._init_weights)
@@ -168,10 +243,27 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
+        """
+        idx: (B, T) or (N, B, T)
+        targets: (B, T) or (N, B, T) (same shape as idx)
+        Returns:
+            if targets is None: logits (same leading dimensions)
+            else: (logits, loss) where loss is a scalar (for 2D input) or a tensor of shape (N,) (for 3D input)
+        """
+        if idx.dim() == 3:
+            N, B, T = idx.shape
+            has_pop = True
+        else:
+            B, T = idx.shape
+            N = 1
+            has_pop = False
+            idx = idx.unsqueeze(0)       # (1, B, T)
+            if targets is not None:
+                targets = targets.unsqueeze(0)
+
         device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, T, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -184,13 +276,18 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(N*B*T, -1), targets.view(N*B*T), ignore_index=-1, reduction='none')
+            loss = loss.view(N, B*T).mean(dim=1)   # (N,)
+            if not has_pop:
+                # original scalar loss expected
+                loss = loss.mean()
+            return logits, loss
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
-
-        return logits, loss
+            logits = self.lm_head(x[:, :, [-1], :])   # (N, B, 1, vocab_size)
+            if not has_pop:
+                logits = logits.squeeze(0)            # (B, 1, vocab_size)
+            return logits, None
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -214,10 +311,10 @@ class GPT(nn.Module):
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024),
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280),
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
         }[model_type]
         print("forcing vocab_size=50257, block_size=1024, bias=True")
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
@@ -227,18 +324,18 @@ class GPT(nn.Module):
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
+        # Add default EGGROLL parameters (sigma and rank) – they will not be loaded from HF
+        config_args['sigma'] = 0.01
+        config_args['rank'] = 1
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
-        # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
