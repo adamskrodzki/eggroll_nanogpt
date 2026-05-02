@@ -1,8 +1,6 @@
 # nanoGPT + EGGROLL
 
-Evolutionary Gradient generation with GRadient-fRee Optimization for Large-scale Learning.
-Trains GPT-style transformers without backpropagation — replaces gradient descent with
-evolutionary population-based updates.
+Based on Evolution Strategies at the Hyperscale [paper](https://arxiv.org/abs/2511.16652)
 
 ## Quick start
 
@@ -27,6 +25,7 @@ python sample.py --out_dir=out-shakespeare-char
 ## Strategy
 
 Population sampling strategy can be selected via `strategy=`:
+- `standard` — Faithful to original paper
 - `standard` — random A/B each generation (default)
 - `elitist` — inherits 10% best + children with noise from prior generation
 - `greedy`, `greedy_local` — gradient-free variants
