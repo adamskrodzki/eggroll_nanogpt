@@ -13,7 +13,7 @@ import pickle
 import numpy as np
 import torch
 
-from model import GPTConfig, GPT, EGGROLLinear
+from model import GPTConfig, GPT, EGGROLLinear, LayerNorm
 from strategies import STRATEGY_REGISTRY
 
 # -----------------------------------------------------------------------------
@@ -86,9 +86,12 @@ model.to(device)
 
 # EGGROLL: collect all linear layers
 linear_layers = [module for module in model.modules() if isinstance(module, EGGROLLinear)]
+ln_layers = [module for module in model.modules() if isinstance(module, LayerNorm)]
 
 # EGGROLL: instantiate update strategy
 egroll_strategy = STRATEGY_REGISTRY[strategy](alpha=alpha, sigma=sigma, rank=rank, pop_size=pop_size)
+egroll_strategy.ln_layers = ln_layers
+egroll_strategy.wpe_module = model
 
 # compile the model
 if compile:
@@ -102,6 +105,9 @@ def estimate_loss():
     model.eval()
     for layer in linear_layers:
         layer.set_population(None, None)
+    for ln in ln_layers:
+        ln.set_noise(None, None)
+    model.set_wpe_noise(None)
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
@@ -134,8 +140,7 @@ while True:
         acc_loss += loss_per_member
 
     avg_loss = acc_loss / accumulation_steps
-    fitness = -avg_loss.detach()
-    fitness = fitness - fitness.mean()
+    fitness = egroll_strategy._compute_fitness(avg_loss)
 
     egroll_strategy.compute_update(linear_layers, fitness, avg_loss)
     egroll_strategy.on_generation_end(avg_loss)

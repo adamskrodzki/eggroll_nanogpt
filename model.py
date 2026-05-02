@@ -21,6 +21,7 @@ class EGGROLLinear(nn.Module):
         self.reset_parameters()
         self.A = None
         self.B = None
+        self.bias_noise = None
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.M, a=math.sqrt(5))
@@ -29,9 +30,10 @@ class EGGROLLinear(nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
-    def set_population(self, A, B):
+    def set_population(self, A, B, bias_noise=None):
         self.A = A
         self.B = B
+        self.bias_noise = bias_noise
 
     def forward(self, x):
         if self.A is None or x.dim() == 3:
@@ -44,6 +46,8 @@ class EGGROLLinear(nn.Module):
         if self.bias is not None:
             base += self.bias
         base = base.unsqueeze(0).expand(N, -1, -1, -1)
+        if self.bias_noise is not None:
+            base = base + (self.sigma * self.bias_noise).unsqueeze(1).unsqueeze(2)
         x_flat = x.view(N, B*T, in_f)
         tmp = torch.einsum('nbd, nir -> nbr', x_flat, self.B)
         correction = (self.sigma / math.sqrt(self.r)) * torch.einsum('nbr, nor -> nbo', tmp, self.A)
@@ -52,12 +56,31 @@ class EGGROLLinear(nn.Module):
 
 
 class LayerNorm(nn.Module):
-    def __init__(self, ndim, bias):
+    def __init__(self, ndim, bias, sigma=0.01):
         super().__init__()
+        self.sigma = sigma
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.weight_noise = None
+        self.bias_noise = None
+
+    def set_noise(self, weight_noise=None, bias_noise=None):
+        self.weight_noise = weight_noise
+        self.bias_noise = bias_noise
 
     def forward(self, input):
+        if input.dim() == 4 and self.weight_noise is not None:
+            N, B, T, C = input.shape
+            normed = F.layer_norm(input, (C,), None, None, 1e-5)
+            w = self.weight + self.sigma * self.weight_noise
+            out = normed * w[:, None, None, :]
+            if self.bias is not None:
+                if self.bias_noise is not None:
+                    b = self.bias + self.sigma * self.bias_noise
+                else:
+                    b = self.bias
+                out = out + b[:, None, None, :]
+            return out
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
@@ -130,9 +153,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias, sigma=config.sigma)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias, sigma=config.sigma)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -166,10 +189,11 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias, sigma=config.sigma),
         ))
         self.lm_head = EGGROLLinear(config.n_embd, config.vocab_size, bias=False, sigma=config.sigma, r=config.rank)
         self.transformer.wte.weight = self.lm_head.M
+        self.wpe_noise = None
 
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -180,6 +204,9 @@ class GPT(nn.Module):
 
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
+
+    def set_wpe_noise(self, noise):
+        self.wpe_noise = noise
 
     def _init_weights(self, module):
         if isinstance(module, nn.Embedding):
@@ -205,7 +232,11 @@ class GPT(nn.Module):
         pos = torch.arange(0, T, dtype=torch.long, device=device)
 
         tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
+        pos_emb_base = self.transformer.wpe(pos)
+        if has_pop and self.wpe_noise is not None:
+            pos_emb = pos_emb_base.unsqueeze(0).unsqueeze(1) + self.config.sigma * self.wpe_noise[:, :T, :].unsqueeze(1)
+        else:
+            pos_emb = pos_emb_base
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
