@@ -14,17 +14,15 @@ class GreedyEGGROLL(EGGROLLStrategy):
 
     def compute_update(self, linear_layers, fitness, avg_loss):
         alpha = self.alpha
-        rank = self.rank
+        sigma = self.sigma
         best_idx = torch.argmax(fitness).item()
         best_fit = fitness[best_idx]
         for layer in linear_layers:
-            if rank == 1:
-                A_best = layer.A[best_idx].squeeze(-1)
-                B_best = layer.B[best_idx].squeeze(-1)
-                delta = best_fit * alpha * torch.outer(A_best, B_best)
-            else:
-                A_best = layer.A[best_idx]
-                B_best = layer.B[best_idx]
-                delta = best_fit * alpha * (A_best @ B_best.T)
+            # A_best: (out_features, rank), B_best: (in_features, rank)
+            A_best = layer.A[best_idx]
+            B_best = layer.B[best_idx]
+            # delta: (out_features, in_features) = best_fit * (alpha/sigma) * A_best @ B_best.T
+            delta = best_fit * (alpha / sigma) * (A_best @ B_best.T)
+            assert delta.shape == layer.M.shape, f"expected ({layer.out_features}, {layer.in_features}), got {delta.shape}"
             layer.M.data += delta
             layer.set_population(None, None)
