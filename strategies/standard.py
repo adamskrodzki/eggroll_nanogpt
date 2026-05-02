@@ -15,13 +15,14 @@ class StandardEGGROLL(EGGROLLStrategy):
     def compute_update(self, linear_layers, fitness, avg_loss):
         N = self.pop_size
         alpha = self.alpha
-        rank = self.rank
+        sigma = self.sigma
         for layer in linear_layers:
-            A = layer.A.squeeze(-1) if rank == 1 else layer.A.view(N, -1, rank)
-            B = layer.B.squeeze(-1) if rank == 1 else layer.B.view(N, -1, rank)
-            if rank == 1:
-                delta = (alpha / N) * (A.T @ (fitness.unsqueeze(1) * B))
-            else:
-                delta = (alpha / N) * torch.einsum('nr,ni,no->oi', fitness, B, A)
+            # A: (N, out_features, rank), B: (N, in_features, rank)
+            A = layer.A
+            B = layer.B
+            # delta: (out_features, in_features) = (alpha/(N*sigma)) * Σ_n fitness[n] * A[n] @ B[n].T
+            # einsum: sum over n (pop) and r (rank), keep o (out) and i (in)
+            delta = (alpha / (N * sigma)) * torch.einsum('n,nor,nir->oi', fitness, A, B)
+            assert delta.shape == layer.M.shape, f"expected ({layer.out_features}, {layer.in_features}), got {delta.shape}"
             layer.M.data += delta
             layer.set_population(None, None)
